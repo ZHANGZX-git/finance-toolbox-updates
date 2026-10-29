@@ -1,0 +1,192 @@
+name: Validate Windows installer automatic-update arguments
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Published repaired stable release
+        required: true
+        default: v0.1.6
+      sha256:
+        description: Reviewed Windows x64 installer SHA256
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  exact-auto-flags:
+    runs-on: windows-2022
+    timeout-minutes: 12
+    env:
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      EXPECTED_SHA256: ${{ inputs.sha256 }}
+    steps:
+      - name: Isolate the real updater arguments without an old application process
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GH_REPO -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Invalid repository' }
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$') { throw 'Invalid release tag' }
+          if ($env:EXPECTED_SHA256 -notmatch '^[a-fA-F0-9]{64}$') { throw 'Invalid SHA256' }
+          $version = $env:RELEASE_TAG.Substring(1)
+          if ([version]$version -lt [version]'0.1.6') { throw 'Only the repaired stable release may be tested' }
+          $work = Join-Path $env:RUNNER_TEMP 'finance-toolbox-installer-auto-flags'
+          $pending = Join-Path $work 'pending'
+          New-Item -ItemType Directory -Path $pending -Force | Out-Null
+          $installDir = Join-Path $work '财务工具箱 自动参数 验收'
+          $appExe = Join-Path $installDir '财务工具箱.exe'
+          $uninstaller = Join-Path $installDir 'Uninstall 财务工具箱.exe'
+          $dataDir = Join-Path $env:APPDATA '财务工具箱\engine'
+          $marker = Join-Path $dataDir 'synthetic-auto-flags-preservation.txt'
+          $reportFile = Join-Path $work 'installer-auto-flags-result.json'
+          $report = [ordered]@{ status='RUNNING'; runner='windows-2022'; expectedVersion=$version; arguments=@('--updated','/S','--force-run'); checks=[ordered]@{}; diagnostics=@() }
+          $stage = 'download and verify public installers'
+          $newInstaller = Join-Path $pending "FinanceToolbox-$version-win-x64.exe"
+          $oldInstaller = Join-Path $work 'FinanceToolbox-0.1.4-win-x64.exe'
+          $installerProcess = $null
+
+          function Get-ApplicationProcesses {
+            return @(Get-CimInstance Win32_Process | Where-Object {
+              $_.ExecutablePath -and ($_.ExecutablePath -eq $appExe -or $_.ExecutablePath.StartsWith((Join-Path $installDir 'resources\engine\'), [StringComparison]::OrdinalIgnoreCase))
+            })
+          }
+          function Get-MainProcesses {
+            return @(Get-ApplicationProcesses | Where-Object { $_.ExecutablePath -eq $appExe -and $_.CommandLine -notmatch '\s--type=' })
+          }
+          function Get-Registration {
+            $result = @()
+            foreach ($scope in @('HKCU','HKLM')) {
+              $result += @(Get-ItemProperty "$($scope):\Software\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue | Where-Object {
+                $_.UninstallString -eq ('"' + $uninstaller + '" /currentuser') -or $_.UninstallString -eq ('"' + $uninstaller + '" /allusers')
+              } | ForEach-Object { [pscustomobject]@{ scope=$scope; version=$_.DisplayVersion; uninstallString=$_.UninstallString; key=$_.PSChildName } })
+            }
+            return @($result)
+          }
+          function Get-ApplicationInstallKeys {
+            return @(Get-ItemProperty 'HKCU:\Software\*' -ErrorAction SilentlyContinue | Where-Object { $_.InstallLocation -eq $installDir } | ForEach-Object {
+              [pscustomobject]@{ scope='HKCU'; key=$_.PSChildName; installLocation=$_.InstallLocation }
+            })
+          }
+          function Assert-Registration([string]$Expected) {
+            $records = @(Get-Registration)
+            if ($records.Count -ne 1 -or $records[0].scope -ne 'HKCU' -or $records[0].version -ne $Expected -or $records[0].uninstallString -ne ('"' + $uninstaller + '" /currentuser')) { throw 'Registered scope, version or uninstall location differs' }
+            $keys = @(Get-ApplicationInstallKeys)
+            if ($keys.Count -ne 1) { throw 'Original HKCU InstallLocation changed or disappeared' }
+            if (-not (Test-Path -LiteralPath $appExe -PathType Leaf)) { throw 'Original installed executable is missing' }
+          }
+          function Assert-Marker {
+            if (-not (Test-Path -LiteralPath $marker -PathType Leaf) -or (Get-Content -LiteralPath $marker -Raw) -ne "SYNTHETIC AUTO FLAGS VALIDATION ONLY`n") { throw 'Synthetic user-data marker changed' }
+          }
+          function Wait-Until([scriptblock]$Probe, [int]$Seconds, [string]$Label) {
+            $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+            do {
+              $value = & $Probe
+              if ($value) { return $value }
+              Start-Sleep -Milliseconds 500
+            } while ([DateTime]::UtcNow -lt $deadline)
+            throw "$Label timed out"
+          }
+          function Invoke-BoundedInstaller([string]$Exe, [string[]]$Arguments, [string]$Label) {
+            Write-Host "Running $Label"
+            $process = Start-Process -FilePath $Exe -ArgumentList $Arguments -PassThru
+            $null = $process.Handle
+            if (-not $process.WaitForExit(120000)) {
+              taskkill /PID $process.Id /T /F | Out-Null
+              throw "$Label timed out"
+            }
+            if ($null -eq $process.ExitCode) { throw "$Label exit code unavailable" }
+            return [int]$process.ExitCode
+          }
+
+          try {
+            $release = gh api "repos/$env:GH_REPO/releases/tags/$env:RELEASE_TAG" | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or $release.draft -or $release.prerelease -or -not $release.published_at) { throw 'Requested release must be publicly published and stable' }
+            gh release download v0.1.4 --repo $env:GH_REPO --pattern FinanceToolbox-0.1.4-win-x64.exe --dir $work
+            if ($LASTEXITCODE -ne 0) { throw 'Old installer download failed' }
+            gh release download $env:RELEASE_TAG --repo $env:GH_REPO --pattern "FinanceToolbox-$version-win-x64.exe" --dir $pending
+            if ($LASTEXITCODE -ne 0) { throw 'New installer download failed' }
+            $report.installerSha256 = (Get-FileHash -LiteralPath $newInstaller -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($report.installerSha256 -ne $env:EXPECTED_SHA256.ToLowerInvariant()) { throw 'New installer differs from reviewed SHA256' }
+            if ((Get-FileHash -LiteralPath $oldInstaller -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'd3808346548d64f78c3cab50f9e7e0bf7c0e49fb540b031c1a61c3c5c7fd80e7') { throw 'Old installer SHA256 differs' }
+            # No account token is inherited by either installer or its auto-started app.
+            Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
+
+            $stage = 'install old application at a Chinese path with spaces'
+            New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
+            [IO.File]::WriteAllText($marker, "SYNTHETIC AUTO FLAGS VALIDATION ONLY`n", [Text.UTF8Encoding]::new($false))
+            $report.oldInstallerExitCode = Invoke-BoundedInstaller $oldInstaller @('/S','/currentuser',"/D=$installDir") 'old clean install'
+            if ($report.oldInstallerExitCode -ne 0) { throw 'Old clean installer failed' }
+            Assert-Registration '0.1.4'
+            $report.beforeRegistration = @(Get-Registration)
+            $report.beforeInstallKeys = @(Get-ApplicationInstallKeys)
+            $report.oldUninstallerSha256 = (Get-FileHash -LiteralPath $uninstaller -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($report.oldUninstallerSha256 -ne '141035ce8a989ece7167b23e3c34d22b5baaf2ec9058f6e573537b8b3ea6a934') { throw 'Unexpected old uninstaller' }
+            if (@(Get-ApplicationProcesses).Count -ne 0) { throw 'Old application or Python is already running' }
+            $report.checks.oldInstalledInHKCUAtOriginalDirectory = $true
+            $report.checks.noApplicationWasRunning = $true
+
+            $stage = 'run exact automatic-update installer arguments'
+            # Intentionally no /currentuser and no /D: these match NsisUpdater.doInstall.
+            $installerProcess = Start-Process -FilePath $newInstaller -ArgumentList @('--updated','/S','--force-run') -PassThru
+            $null = $installerProcess.Handle
+            $report.installerPid = $installerProcess.Id
+            if (-not $installerProcess.WaitForExit(120000)) {
+              $report.installerTimedOut = $true
+              taskkill /PID $installerProcess.Id /T /F | Out-Null
+              throw 'Automatic-arguments installer timed out'
+            }
+            if ($null -eq $installerProcess.ExitCode) { throw 'New installer exit code unavailable' }
+            $report.installerExitCode = [int]$installerProcess.ExitCode
+            if ($report.installerExitCode -ne 0) { throw 'Automatic-arguments installer returned a failure' }
+            Assert-Registration $version
+            Assert-Marker
+            $report.afterRegistration = @(Get-Registration)
+            $report.afterInstallKeys = @(Get-ApplicationInstallKeys)
+            $report.newUninstallerSha256 = (Get-FileHash -LiteralPath $uninstaller -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($report.newUninstallerSha256 -eq $report.oldUninstallerSha256) { throw 'Uninstaller was not replaced' }
+            $report.checks.sameHKCUScopeAndOriginalInstallLocation = $true
+            $report.checks.registryVersionUpdated = $true
+            $report.checks.syntheticMarkerPreserved = $true
+
+            $stage = 'observe automatic application start and close its window'
+            $null = Wait-Until { @(Get-MainProcesses).Count -ge 1 } 45 'Automatic main application start'
+            $report.checks.automaticApplicationStartObserved = $true
+            $main = @(Get-MainProcesses)
+            if ($main.Count -ne 1) { throw 'Expected exactly one main application process' }
+            $pidToClose = [int]$main[0].ProcessId
+            $applicationProcess = Get-Process -Id $pidToClose -ErrorAction Stop
+            $null = Wait-Until { $applicationProcess.Refresh(); $applicationProcess.MainWindowHandle -ne 0 } 30 'Application main window'
+            if (-not $applicationProcess.CloseMainWindow()) { throw 'Could not gracefully close application window' }
+            $null = Wait-Until { @(Get-ApplicationProcesses).Count -eq 0 } 45 'Application and Python shutdown'
+            Assert-Marker
+            Assert-Registration $version
+            $report.checks.applicationAndPythonClosedGracefully = $true
+            $report.checks.markerPreservedAfterAutomaticStart = $true
+            $report.status = 'PASS'
+          } catch {
+            $report.status = 'FAIL'
+            $report.failedStage = $stage
+            $report.failureClass = $_.Exception.GetType().Name
+            $report.diagnostics += 'Aggregate validation failed; no database or financial-file contents were collected.'
+          } finally {
+            $report.finalRegistration = @(Get-Registration)
+            $report.finalInstallKeys = @(Get-ApplicationInstallKeys)
+            if (Test-Path -LiteralPath $uninstaller -PathType Leaf) { $report.finalUninstallerSha256 = (Get-FileHash -LiteralPath $uninstaller -Algorithm SHA256).Hash.ToLowerInvariant() }
+            $report.remainingApplicationProcesses = @(Get-ApplicationProcesses | ForEach-Object { @{pid=[int]$_.ProcessId; executable=[IO.Path]::GetFileName($_.ExecutablePath)} })
+            $report | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $reportFile -Encoding utf8
+            $report | ConvertTo-Json -Depth 10 | Write-Host
+          }
+          if ($report.status -ne 'PASS') { throw 'Exact automatic-update argument validation failed' }
+
+      - name: Upload aggregate installer-argument report only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer-auto-flags-validation
+          path: ${{ runner.temp }}/finance-toolbox-installer-auto-flags/installer-auto-flags-result.json
+          if-no-files-found: warn
+          retention-days: 14
