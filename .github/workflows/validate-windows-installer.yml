@@ -12,7 +12,9 @@ on:
         required: true
 
 permissions:
-  contents: read
+  # GitHub draft release assets are visible only to accounts with push access.
+  # This manually dispatched test never writes releases or repository contents.
+  contents: write
 
 jobs:
   install-upgrade-uninstall:
@@ -61,6 +63,7 @@ jobs:
             if ($null -eq $process.ExitCode) { throw "$Label did not provide an exit code" }
             $exit = [int]$process.ExitCode
             $results.Add(@{ check=$Label; exitCode=$exit })
+            @{ version=$version; checks=$results } | ConvertTo-Json -Depth 8 | Set-Content validation-result.json -Encoding utf8
             Write-Host "$Label exit code: $exit"
             return $exit
           }
@@ -98,7 +101,7 @@ jobs:
           Assert-Version $version
           Assert-Marker
           Copy-Item $uninstaller $fixedUninstallerCopy -Force
-          if ((Invoke-BoundedInstaller $fixedUninstallerCopy @('/S','/KEEP_APP_DATA','/currentuser','--updated',"_?=$installDir") 'final-uninstall') -ne 0) { throw 'Final uninstall failed' }
+          if ((Invoke-BoundedInstaller $fixedUninstallerCopy @('/S','/KEEP_APP_DATA','/currentuser',"_?=$installDir") 'final-uninstall') -ne 0) { throw 'Final uninstall failed' }
           Assert-Marker
           $report = @{ version=$version; runner='windows-2022'; installerSha256=$env:EXPECTED_SHA256; oldUninstallerSha256=$badHash; newUninstallerSha256=$fixedHash; dataPreserved=$true; checks=$results }
           $report | ConvertTo-Json -Depth 8 | Tee-Object -FilePath validation-result.json
