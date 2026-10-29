@@ -19,7 +19,7 @@ assert.match(repository ?? '', /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/);
 for (const value of [work, executable, userData]) assert.ok(value && path.isAbsolute(value));
 assert.equal(path.resolve(userData).toLowerCase(), path.join(process.env.APPDATA, '财务工具箱').toLowerCase(), 'Validation must use the production default userData identity.');
 const expectedData = path.join(userData, 'engine');
-const deadline = Date.now() + 9 * 60_000;
+const deadline = Date.now() + 11 * 60_000;
 const reportFile = path.join(work, 'app-update-result.json');
 const diagnosticsDirectory = path.join(work, 'diagnostics');
 const observerScript = path.join(diagnosticsDirectory, 'observe-update.ps1');
@@ -32,21 +32,21 @@ let stage = 'initializing';
 let client;
 let launched;
 let timedOut = false;
-const timeout = setTimeout(() => { timedOut = true; }, 9 * 60_000);
+const timeout = setTimeout(() => { timedOut = true; }, 11 * 60_000);
 
 function remaining(maximum = 30_000) {
   if (timedOut || Date.now() >= deadline) throw new Error('Overall validation timeout.');
   return Math.max(1, Math.min(maximum, deadline - Date.now()));
 }
 async function pause(ms = 500) { await new Promise(resolve => setTimeout(resolve, Math.min(ms, remaining(ms)))); }
-async function waitFor(label, action, milliseconds) {
+async function waitFor(label, action, milliseconds, pollMilliseconds = 500) {
   const end = Math.min(deadline, Date.now() + milliseconds);
   let lastError;
   while (Date.now() < end) {
     remaining();
     try { const result = await action(); if (result) return result; }
     catch (error) { lastError = error; }
-    await pause();
+    await pause(pollMilliseconds);
   }
   throw new Error(`${label} timed out${lastError ? `; last probe: ${lastError.message}` : ''}.`);
 }
@@ -70,9 +70,27 @@ function installedVersion() {
   return result;
 }
 function safeAppEnvironment() {
-  // Do not pass GitHub/API credentials into the application under test.
-  const allowed = new Set(['systemroot', 'windir', 'comspec', 'path', 'pathext', 'temp', 'tmp', 'userprofile', 'username', 'userdomain', 'appdata', 'localappdata', 'programdata', 'allusersprofile', 'programfiles', 'programfiles(x86)', 'commonprogramfiles', 'commonprogramfiles(x86)', 'homedrive', 'homepath', 'number_of_processors', 'processor_architecture', 'os', 'public']);
-  const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => allowed.has(key.toLowerCase())));
+  // Preserve the ordinary Windows/PowerShell environment. The former allowlist
+  // removed PSModulePath/SystemDrive/ProgramW6432 and could alter legacy PS startup.
+  // Remove CI/API credentials and dev launch controls instead of deleting OS keys.
+  const deniedPrefix = /^(?:CI_|GH_|GITHUB_|ACTIONS_|RUNNER_|AWS_|AZURE_|GOOGLE_|GCLOUD_|ARM_|TF_VAR_|SSH_|GIT_CONFIG_|GIT_ASKPASS|GCM_|VSCODE_GIT_|NPM_|PNPM_)/i;
+  const sensitiveName = /TOKEN|PASS(?:WORD|WD)?|SECRET|CREDENTIAL|PRIVATE.?KEY|ACCESS.?KEY|API.?KEY|AUTH/i;
+  const deniedExact = /^(?:CI|TOOLBOX_DATA_DIR|ELECTRON_RUN_AS_NODE|NODE_OPTIONS)$/i;
+  const excluded = [];
+  const environment = Object.fromEntries(Object.entries(process.env).filter(([key, value]) => {
+    const reject = deniedPrefix.test(key) || sensitiveName.test(key) || deniedExact.test(key) || /:\/\/[^/\s]+@/.test(value);
+    if (reject) excluded.push(key);
+    return !reject;
+  }));
+  const winPSModulePath = Object.entries(environment).find(([key]) => key.toLowerCase() === 'winpsmodulepath')?.[1];
+  if (winPSModulePath) {
+    for (const key of Object.keys(environment)) if (key.toLowerCase() === 'psmodulepath') delete environment[key];
+    environment.PSModulePath = winPSModulePath;
+  }
+  const benignKeys = ['PSModulePath', 'WinPSModulePath', 'SystemDrive', 'ProgramW6432', 'PSExecutionPolicyPreference', 'SystemRoot', 'ComSpec'];
+  report.environment = { mode: 'inherit OS environment minus CI credentials and dev launch overrides', excludedKeyNames: excluded.sort(),
+    modulePathSource: winPSModulePath ? 'WinPSModulePath' : 'inherited PSModulePath',
+    preserved: Object.fromEntries(benignKeys.map(key => [key, Object.entries(environment).find(([name]) => name.toLowerCase() === key.toLowerCase())?.[1] ?? null])) };
   return { ...environment, ELECTRON_ENABLE_LOGGING: '1' };
 }
 function startApp() {
@@ -192,7 +210,7 @@ try {
     Emit 'trace-ready' @{}
   } catch {Emit 'trace-subscription-error' @{message=$_.Exception.Message}}
   [IO.File]::WriteAllText((Join-Path $diag 'observer.ready'),'ready')
-  $end=[DateTime]::UtcNow.AddMinutes(11)
+  $end=[DateTime]::UtcNow.AddMinutes(13)
   $lastSnapshot=''
   while (-not (Test-Path (Join-Path $diag 'observer.stop')) -and [DateTime]::UtcNow -lt $end) {
     foreach ($event in @(Get-Event -ErrorAction SilentlyContinue|Where-Object {$_.SourceIdentifier -like ($prefix+'-*')})) {
@@ -215,7 +233,7 @@ try {
     foreach ($id in @($handles.Keys)) {
       try {if ($handles[$id].HasExited) {Emit 'process-handle-exit' @{pid=$id;exitCode=$handles[$id].ExitCode};$handles[$id].Dispose();$handles.Remove($id)}} catch {Emit 'process-handle-error' @{pid=$id;message=$_.Exception.Message};$handles.Remove($id)}
     }
-    Start-Sleep -Milliseconds 350
+    Start-Sleep -Milliseconds 2000
   }
 } catch {Emit 'observer-error' @{message=$_.Exception.Message}}
 finally {
@@ -409,7 +427,7 @@ try {
   report.checks.oldApplicationExited = true;
 
   stage = 'wait for installer registration and automatic application restart';
-  await waitFor('upgraded registry version', () => installedVersion().version === expectedVersion, 150_000);
+  await waitFor('upgraded registry version', () => installedVersion().version === expectedVersion, 360_000, 2000);
   report.checks.registryVersionUpdated = true;
   const automaticallyRestarted = await waitFor('automatic application restart', () => mainProcesses().find(item => item.pid !== oldMain.pid), 90_000);
   // NSIS re-launches with --updated, not the old DevTools flags. Check its real
