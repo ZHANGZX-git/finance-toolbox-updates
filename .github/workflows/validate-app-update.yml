@@ -81,11 +81,13 @@ jobs:
           node .github/scripts/validate-app-update.mjs
           if ($LASTEXITCODE -ne 0) { throw 'Real application update validation failed' }
 
-      - name: Upload aggregate validation report only
+      - name: Upload synthetic runner report and installer diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: windows-in-app-update-validation
-          path: ${{ runner.temp }}/finance-toolbox-in-app-update/app-update-result.json
+          path: |
+            ${{ runner.temp }}/finance-toolbox-in-app-update/app-update-result.json
+            ${{ runner.temp }}/finance-toolbox-in-app-update/diagnostics/
           if-no-files-found: warn
           retention-days: 14
