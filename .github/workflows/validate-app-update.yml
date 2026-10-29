@@ -1,0 +1,91 @@
+name: Validate published Windows in-app update
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Published stable release to offer to the real 0.1.4 application (v0.1.6 or later)
+        required: true
+        default: v0.1.6
+      sha256:
+        description: Reviewed SHA256 of that release's Windows x64 installer
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  real-in-app-update:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    env:
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      EXPECTED_SHA256: ${{ inputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Require a public stable release and install the reviewed old application
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GH_REPO -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Invalid repository' }
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$') { throw 'Invalid release tag' }
+          if ($env:EXPECTED_SHA256 -notmatch '^[a-fA-F0-9]{64}$') { throw 'Invalid SHA256' }
+          $version = $env:RELEASE_TAG.Substring(1)
+          if ([version]$version -lt [version]'0.1.6') { throw 'Only the repaired 0.1.6 stable release or a later stable release may be tested' }
+          $repo = gh api "repos/$env:GH_REPO" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $repo.private) { throw 'Validation requires a public repository' }
+          $release = gh api "repos/$env:GH_REPO/releases/tags/$env:RELEASE_TAG" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $release.draft -or $release.prerelease -or -not $release.published_at) { throw 'The requested release must already be formally published, non-draft and non-prerelease' }
+          $latest = gh api "repos/$env:GH_REPO/releases/latest" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $latest.tag_name -ne $env:RELEASE_TAG) { throw 'Requested release is not the latest public stable release' }
+          $newName = "FinanceToolbox-$version-win-x64.exe"
+          $assets = @($release.assets | Where-Object name -eq $newName)
+          if ($assets.Count -ne 1 -or @($release.assets | Where-Object name -eq 'latest.yml').Count -ne 1) { throw 'Installer or update index is missing from the formal release' }
+          if ($assets[0].digest -and $assets[0].digest.ToLowerInvariant() -ne "sha256:$($env:EXPECTED_SHA256.ToLowerInvariant())") { throw 'Published installer digest differs from the reviewed hash' }
+          $work = Join-Path $env:RUNNER_TEMP 'finance-toolbox-in-app-update'
+          New-Item -ItemType Directory -Path $work -Force | Out-Null
+          $installDir = Join-Path $work '财务工具箱 升级验收 安装'
+          # Use the production userData identity. This disposable runner contains
+          # no real user records, and Explorer relaunch need not inherit dev env.
+          $userData = Join-Path $env:APPDATA '财务工具箱'
+          if ((Test-Path $userData) -and @(Get-ChildItem -LiteralPath $userData -Force).Count -ne 0) { throw 'Production userData must be absent or empty on the fresh synthetic runner' }
+          $oldInstaller = Join-Path $work 'FinanceToolbox-0.1.4-win-x64.exe'
+          gh release download v0.1.4 --repo $env:GH_REPO --pattern FinanceToolbox-0.1.4-win-x64.exe --dir $work
+          if ($LASTEXITCODE -ne 0) { throw 'Old public installer download failed' }
+          if ((Get-FileHash $oldInstaller -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'd3808346548d64f78c3cab50f9e7e0bf7c0e49fb540b031c1a61c3c5c7fd80e7') { throw 'Public 0.1.4 installer does not match its reviewed original SHA256' }
+          $process = Start-Process -FilePath $oldInstaller -ArgumentList @('/S','/currentuser',"/D=$installDir") -PassThru
+          $null = $process.Handle
+          if (-not $process.WaitForExit(120000)) { taskkill /PID $process.Id /T /F | Out-Null; throw 'Old clean installation timed out' }
+          $exitCode = $process.ExitCode
+          if ($null -eq $exitCode) { throw 'Old clean installer exit code is unavailable' }
+          if ($exitCode -ne 0) { throw "Old clean installation failed: $exitCode" }
+          $appExe = Join-Path $installDir '财务工具箱.exe'
+          if (-not (Test-Path $appExe)) { throw 'Old application executable is missing' }
+          "EXPECTED_VERSION=$version" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "VALIDATION_WORK=$work" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "VALIDATION_APP_EXE=$appExe" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "VALIDATION_USER_DATA=$userData" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Exercise real check, download, restart-install and persisted synthetic data
+        shell: pwsh
+        run: |
+          # The helper uses Node 24's fetch/WebSocket CDP client and only synthetic
+          # userData. It never starts the new installer directly or supplies a PAT.
+          node .github/scripts/validate-app-update.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Real application update validation failed' }
+
+      - name: Upload aggregate validation report only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-in-app-update-validation
+          path: ${{ runner.temp }}/finance-toolbox-in-app-update/app-update-result.json
+          if-no-files-found: warn
+          retention-days: 14
