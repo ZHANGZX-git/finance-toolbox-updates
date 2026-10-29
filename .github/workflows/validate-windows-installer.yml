@@ -53,27 +53,31 @@ jobs:
           function Invoke-BoundedInstaller([string]$Exe, [string[]]$Arguments, [string]$Label) {
             Write-Host "Running $Label"
             $process = Start-Process -FilePath $Exe -ArgumentList $Arguments -PassThru
+            $null = $process.Handle
             if (-not $process.WaitForExit(120000)) {
               taskkill /PID $process.Id /T /F | Out-Null
               throw "$Label timed out"
             }
-            $process.Refresh()
-            $results.Add(@{ check=$Label; exitCode=$process.ExitCode })
-            Write-Host "$Label exit code: $($process.ExitCode)"
-            return $process.ExitCode
+            if ($null -eq $process.ExitCode) { throw "$Label did not provide an exit code" }
+            $exit = [int]$process.ExitCode
+            $results.Add(@{ check=$Label; exitCode=$exit })
+            Write-Host "$Label exit code: $exit"
+            return $exit
           }
           function Assert-Marker {
             if (-not (Test-Path $marker) -or (Get-Content $marker -Raw) -notmatch 'SYNTHETIC DATA') { throw 'User data preservation failed' }
           }
           function Assert-Version([string]$Expected) {
-            $entries = @(Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object DisplayName -eq '财务工具箱')
+            $entries = @(Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.UninstallString -eq ('"' + $uninstaller + '" /currentuser') })
             if ($entries.Count -ne 1 -or $entries[0].DisplayVersion -ne $Expected) { throw "Installed registry version differs from $Expected" }
             if (-not (Test-Path $appExe)) { throw 'Installed executable missing' }
           }
           if ((Invoke-BoundedInstaller $oldInstaller @('/S','/currentuser',"/D=$installDir") 'old-clean-install') -ne 0) { throw 'Old install failed' }
           Assert-Version '0.1.4'
           $badHash = (Get-FileHash $uninstaller -Algorithm SHA256).Hash
-          $badExit = Invoke-BoundedInstaller $uninstaller @('/S','/KEEP_APP_DATA','/currentuser','--updated',"_?=$installDir") 'old-uninstaller-reproduction'
+          $oldUninstallerCopy = Join-Path $work 'old-uninstaller-test.exe'
+          Copy-Item $uninstaller $oldUninstallerCopy
+          $badExit = Invoke-BoundedInstaller $oldUninstallerCopy @('/S','/KEEP_APP_DATA','/currentuser','--updated',"_?=$installDir") 'old-uninstaller-reproduction'
           if ($badExit -ne 2) { throw "Expected corrupt old uninstaller exit 2, got $badExit" }
           Assert-Version '0.1.4'
           Assert-Marker
@@ -82,7 +86,9 @@ jobs:
           Assert-Marker
           $fixedHash = (Get-FileHash $uninstaller -Algorithm SHA256).Hash
           if ($fixedHash -eq $badHash) { throw 'New uninstaller still equals old corrupt file' }
-          if ((Invoke-BoundedInstaller $uninstaller @('/S','/KEEP_APP_DATA','/currentuser','--updated',"_?=$installDir") 'new-uninstaller') -ne 0) { throw 'New uninstaller failed' }
+          $fixedUninstallerCopy = Join-Path $work 'fixed-uninstaller-test.exe'
+          Copy-Item $uninstaller $fixedUninstallerCopy
+          if ((Invoke-BoundedInstaller $fixedUninstallerCopy @('/S','/KEEP_APP_DATA','/currentuser','--updated',"_?=$installDir") 'new-uninstaller') -ne 0) { throw 'New uninstaller failed' }
           if (Test-Path $appExe) { throw 'Application not removed' }
           Assert-Marker
           if ((Invoke-BoundedInstaller $newInstaller @('/S','/currentuser',"/D=$installDir") 'new-clean-install') -ne 0) { throw 'New clean install failed' }
@@ -91,7 +97,8 @@ jobs:
           if ((Invoke-BoundedInstaller $newInstaller @('/S','/currentuser',"/D=$installDir") 'new-overwrite-install') -ne 0) { throw 'New overwrite install failed' }
           Assert-Version $version
           Assert-Marker
-          if ((Invoke-BoundedInstaller $uninstaller @('/S','/KEEP_APP_DATA','/currentuser','--updated',"_?=$installDir") 'final-uninstall') -ne 0) { throw 'Final uninstall failed' }
+          Copy-Item $uninstaller $fixedUninstallerCopy -Force
+          if ((Invoke-BoundedInstaller $fixedUninstallerCopy @('/S','/KEEP_APP_DATA','/currentuser','--updated',"_?=$installDir") 'final-uninstall') -ne 0) { throw 'Final uninstall failed' }
           Assert-Marker
           $report = @{ version=$version; runner='windows-2022'; installerSha256=$env:EXPECTED_SHA256; oldUninstallerSha256=$badHash; newUninstallerSha256=$fixedHash; dataPreserved=$true; checks=$results }
           $report | ConvertTo-Json -Depth 8 | Tee-Object -FilePath validation-result.json
