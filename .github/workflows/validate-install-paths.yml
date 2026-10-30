@@ -1,0 +1,222 @@
+name: Validate Windows installation paths
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Draft or published repaired release, v0.1.7 or later
+        required: true
+        default: v0.1.7
+      sha256:
+        description: Reviewed SHA256 of the target Windows x64 installer
+        required: true
+      registry_variant:
+        description: Optional equivalent legacy registry spelling (standard for the first four-path run)
+        type: choice
+        required: true
+        default: standard
+        options:
+          - standard
+          - location-trailing-slash
+          - command-double-separator
+
+permissions:
+  # Needed to read a draft release asset. No release or repository write is performed.
+  contents: write
+
+jobs:
+  legacy-path-upgrade:
+    name: ${{ matrix.path_case }} / ${{ inputs.registry_variant }}
+    runs-on: windows-2022
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        path_case:
+          - userLocalPrograms
+          - programFiles
+          - programFilesX86
+          - customChineseSpaces
+    env:
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      EXPECTED_SHA256: ${{ inputs.sha256 }}
+      PATH_CASE: ${{ matrix.path_case }}
+      REGISTRY_VARIANT: ${{ inputs.registry_variant }}
+    steps:
+      - name: Install real old version, reproduce the guard, upgrade and preserve synthetic data
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GH_REPO -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Invalid repository' }
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$') { throw 'Invalid release tag' }
+          if ($env:EXPECTED_SHA256 -notmatch '^[a-fA-F0-9]{64}$') { throw 'Invalid target SHA256' }
+          $version = $env:RELEASE_TAG.Substring(1)
+          if ([version]$version -lt [version]'0.1.7') { throw 'Target must be v0.1.7 or later' }
+          if ($env:REGISTRY_VARIANT -notin @('standard','location-trailing-slash','command-double-separator')) { throw 'Invalid registry variant' }
+          $work = Join-Path $env:RUNNER_TEMP ('finance-toolbox-paths-' + $env:PATH_CASE)
+          New-Item -ItemType Directory -Path $work -Force | Out-Null
+          $reportPath = Join-Path $work 'path-validation-result.json'
+          $guid = 'd7402221-0d49-5689-bf01-77130581c89d'
+          $applicationKey = "HKCU:\Software\$guid"
+          $uninstallKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$guid"
+          $knownBrokenHash = '141035ce8a989ece7167b23e3c34d22b5baaf2ec9058f6e573537b8b3ea6a934'
+          $dataRoot = Join-Path $env:APPDATA '财务工具箱'
+          $marker = Join-Path $dataRoot 'engine\synthetic-path-upgrade-preservation.txt'
+          $report = [ordered]@{status='RUNNING'; runner='windows-2022'; pathCase=$env:PATH_CASE; registryVariant=$env:REGISTRY_VARIANT; oldVersion='0.1.4'; expectedVersion=$version; installerSha256=$env:EXPECTED_SHA256; checks=[System.Collections.Generic.List[object]]::new()}
+          $stage = 'prepare'
+          $savedGhToken = $env:GH_TOKEN
+          function Save-Report {
+            $report | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $reportPath -Encoding utf8
+          }
+          function Read-Registration {
+            $application = Get-ItemProperty -LiteralPath $applicationKey -ErrorAction SilentlyContinue
+            $uninstall = Get-ItemProperty -LiteralPath $uninstallKey -ErrorAction SilentlyContinue
+            return @{installLocation=$application.InstallLocation; version=$uninstall.DisplayVersion; uninstallString=$uninstall.UninstallString; quietUninstallString=$uninstall.QuietUninstallString}
+          }
+          function Invoke-Installer([string]$Exe, [string[]]$Arguments, [string]$Label, [int]$LimitSeconds=180) {
+            Write-Host "Running $Label"
+            $started = [DateTime]::UtcNow
+            # Retain the native OS environment. Only replace pwsh's module path
+            # with its cached native Windows PS path while creating the child.
+            $modulePath = $env:PSModulePath
+            try {
+              if ($env:WinPSModulePath) { $env:PSModulePath = $env:WinPSModulePath }
+              $process = Start-Process -FilePath $Exe -ArgumentList $Arguments -PassThru
+              $null = $process.Handle
+            } finally { $env:PSModulePath = $modulePath }
+            if (-not $process.WaitForExit($LimitSeconds * 1000)) {
+              $report.checks.Add(@{label=$Label; pid=$process.Id; started=$started.ToString('o'); timedOut=$true})
+              Save-Report
+              taskkill /PID $process.Id /T /F | Out-Null
+              throw "$Label timed out"
+            }
+            if ($null -eq $process.ExitCode) { throw "$Label exit code unavailable" }
+            $exit = [int]$process.ExitCode
+            $report.checks.Add(@{label=$Label; pid=$process.Id; exitCode=$exit; seconds=[Math]::Round(([DateTime]::UtcNow-$started).TotalSeconds,3)})
+            Save-Report
+            return $exit
+          }
+          function Assert-Marker {
+            if (-not (Test-Path -LiteralPath $marker) -or (Get-FileHash -LiteralPath $marker -Algorithm SHA256).Hash -ne $script:markerHash) { throw 'Synthetic userData marker changed or disappeared' }
+          }
+          function Assert-Version([string]$Expected) {
+            $registration = Read-Registration
+            if ($registration.version -ne $Expected) { throw "Expected installed version $Expected, got $($registration.version)" }
+            if (-not (Test-Path -LiteralPath $script:appExe)) { throw 'Application executable is missing' }
+            $actual = [IO.Path]::GetFullPath($registration.installLocation).TrimEnd('\')
+            if ($actual -ne $script:installDir) { throw 'Upgrade moved the registered installation directory' }
+          }
+          try {
+            if (Test-Path -LiteralPath $applicationKey) { throw 'Application install key already exists on this fresh runner' }
+            if (Test-Path -LiteralPath $uninstallKey) { throw 'Application uninstall key already exists on this fresh runner' }
+            if ((Test-Path -LiteralPath $dataRoot) -and @(Get-ChildItem -LiteralPath $dataRoot -Force).Count -ne 0) { throw 'Default userData must be absent or empty; no real user data may be used' }
+            $reproduce016 = $env:PATH_CASE -in @('programFiles','programFilesX86')
+            $oldName = 'FinanceToolbox-0.1.4-win-x64.exe'
+            $newName = "FinanceToolbox-$version-win-x64.exe"
+            foreach ($item in @(@{tag='v0.1.4';file=$oldName},@{tag=$env:RELEASE_TAG;file=$newName})) {
+              gh release download $item.tag --repo $env:GH_REPO --pattern $item.file --dir $work
+              if ($LASTEXITCODE -ne 0) { throw "Release asset download failed: $($item.file)" }
+            }
+            $oldInstaller = Join-Path $work $oldName
+            $newInstaller = Join-Path $work $newName
+            if ((Get-FileHash -LiteralPath $oldInstaller -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'd3808346548d64f78c3cab50f9e7e0bf7c0e49fb540b031c1a61c3c5c7fd80e7') { throw 'Old 0.1.4 installer differs from its reviewed original hash' }
+            if ((Get-FileHash -LiteralPath $newInstaller -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:EXPECTED_SHA256.ToLowerInvariant()) { throw 'Target installer hash mismatch' }
+            if ($reproduce016) {
+              gh release download v0.1.6 --repo $env:GH_REPO --pattern FinanceToolbox-0.1.6-win-x64.exe --dir $work
+              if ($LASTEXITCODE -ne 0) { throw 'Baseline 0.1.6 download failed' }
+              $baselineInstaller = Join-Path $work 'FinanceToolbox-0.1.6-win-x64.exe'
+              if ((Get-FileHash -LiteralPath $baselineInstaller -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'bff1e5f4b4e7bc5fe0ebf95e9baf391871388cbf79169ad5ab607e26e92a9c12') { throw 'Baseline 0.1.6 hash mismatch' }
+            }
+            # All downloads are finished. Do not pass the draft-reading token to
+            # any installer. Leave the ordinary Windows/PowerShell environment intact.
+            $env:GH_TOKEN = $null
+            $requestedDir = switch ($env:PATH_CASE) {
+              'userLocalPrograms' { $null }
+              'programFiles' { Join-Path $env:ProgramW6432 '财务工具箱' }
+              'programFilesX86' { Join-Path ${env:ProgramFiles(x86)} '财务工具箱' }
+              'customChineseSpaces' { Join-Path $work '财务工具箱 自定义 目录' }
+              default { throw 'Unknown matrix case' }
+            }
+            $arguments = @('/S','/currentuser')
+            if ($requestedDir) { $arguments += "/D=$requestedDir" }
+            $stage = 'old-clean-install'
+            if ((Invoke-Installer $oldInstaller $arguments $stage) -ne 0) { throw 'Old 0.1.4 installation failed' }
+            $oldRegistration = Read-Registration
+            $script:installDir = [IO.Path]::GetFullPath($oldRegistration.installLocation).TrimEnd('\')
+            if ($requestedDir) {
+              if ($script:installDir -ne [IO.Path]::GetFullPath($requestedDir).TrimEnd('\')) { throw 'Old installer did not use the requested directory' }
+            } elseif ($script:installDir -ne (Join-Path $env:LOCALAPPDATA 'Programs\finance-toolbox')) { throw 'Old default installation did not use the production LocalAppData Programs directory' }
+            $script:appExe = Join-Path $script:installDir '财务工具箱.exe'
+            $uninstaller = Join-Path $script:installDir 'Uninstall 财务工具箱.exe'
+            $report.installDirectory = $script:installDir
+            $report.oldRegistration = $oldRegistration
+            Assert-Version '0.1.4'
+            if ((Get-FileHash -LiteralPath $uninstaller -Algorithm SHA256).Hash.ToLowerInvariant() -ne $knownBrokenHash) { throw 'Expected the exact known CRC-broken old uninstaller' }
+            $oldAppHash = (Get-FileHash -LiteralPath $script:appExe -Algorithm SHA256).Hash
+            New-Item -ItemType Directory -Path (Split-Path -Parent $marker) -Force | Out-Null
+            Set-Content -LiteralPath $marker 'SYNTHETIC PATH MATRIX DATA: retain across upgrade and normal uninstall' -Encoding utf8
+            $script:markerHash = (Get-FileHash -LiteralPath $marker -Algorithm SHA256).Hash
+            if ($reproduce016) {
+              $stage = 'baseline-0.1.6-program-files-guard'
+              if ((Invoke-Installer $baselineInstaller @('/S','/currentuser') $stage 120) -ne 2) { throw 'Expected 0.1.6 Program Files guard rejection exit 2' }
+              Assert-Version '0.1.4'
+              Assert-Marker
+              if ((Get-FileHash -LiteralPath $uninstaller -Algorithm SHA256).Hash.ToLowerInvariant() -ne $knownBrokenHash) { throw 'Rejected 0.1.6 unexpectedly modified the old uninstaller' }
+              if ((Get-FileHash -LiteralPath $script:appExe -Algorithm SHA256).Hash -ne $oldAppHash) { throw 'Rejected 0.1.6 unexpectedly modified the old application' }
+              $report.baseline016RejectedWithoutMutation = $true
+            }
+            # Optional spelling-only fixtures are applied after baseline control.
+            # They modify only this fresh runner's synthetic application registry.
+            if ($env:REGISTRY_VARIANT -eq 'location-trailing-slash') {
+              Set-ItemProperty -LiteralPath $applicationKey -Name InstallLocation -Value ($script:installDir + '\')
+            } elseif ($env:REGISTRY_VARIANT -eq 'command-double-separator') {
+              $equivalent = '"' + $script:installDir + '\\Uninstall 财务工具箱.exe" /currentuser'
+              Set-ItemProperty -LiteralPath $uninstallKey -Name UninstallString -Value $equivalent
+              Set-ItemProperty -LiteralPath $uninstallKey -Name QuietUninstallString -Value ($equivalent + ' /S')
+            }
+            $report.beforeUpgradeRegistration = Read-Registration
+            $stage = 'target-repair-and-upgrade'
+            # No /D override: the new installer must honor the old registered location.
+            if ((Invoke-Installer $newInstaller @('/S','/currentuser') $stage 300) -ne 0) { throw 'Target repair upgrade failed' }
+            Assert-Version $version
+            Assert-Marker
+            $newHash = (Get-FileHash -LiteralPath $uninstaller -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($newHash -eq $knownBrokenHash) { throw 'New uninstall component still equals the old broken file' }
+            $report.afterUpgradeRegistration = Read-Registration
+            $report.newUninstallerSha256 = $newHash
+            $report.dataPreservedAfterUpgrade = $true
+            $stage = 'normal-uninstall'
+            # Execute a copy outside the application tree, so removal is not blocked
+            # by the executable itself. Do not use --updated for normal uninstall.
+            $outsideCopy = Join-Path $work 'new-uninstaller-outside-install-dir.exe'
+            Copy-Item -LiteralPath $uninstaller -Destination $outsideCopy
+            if ((Invoke-Installer $outsideCopy @('/S','/currentuser','/KEEP_APP_DATA',"_?=$script:installDir") $stage) -ne 0) { throw 'Normal uninstall failed' }
+            if (Test-Path -LiteralPath $script:appExe) { throw 'Normal uninstall did not remove the program' }
+            if (Test-Path -LiteralPath $uninstallKey) { throw 'Normal uninstall did not remove its application uninstall key' }
+            Assert-Marker
+            $report.dataPreservedAfterNormalUninstall = $true
+            $report.status = 'PASS'
+          } catch {
+            $report.status = 'FAIL'
+            $report.failedStage = $stage
+            $report.failureMessage = $_.Exception.Message
+            $report.finalRegistration = Read-Registration
+            $report.remainingProcesses = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -like 'FinanceToolbox*' -or $_.Name -eq 'old-uninstaller.exe' -or $_.Name -eq 'Uninstall 财务工具箱.exe' } | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine)
+            throw
+          } finally {
+            $env:GH_TOKEN = $savedGhToken
+            Save-Report
+            $report | ConvertTo-Json -Depth 12 | Write-Host
+          }
+
+      - name: Upload only synthetic path validation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-install-paths-${{ matrix.path_case }}-${{ inputs.registry_variant }}
+          path: ${{ runner.temp }}/finance-toolbox-paths-${{ matrix.path_case }}/path-validation-result.json
+          if-no-files-found: warn
+          retention-days: 14
