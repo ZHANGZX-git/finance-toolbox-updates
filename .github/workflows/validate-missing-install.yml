@@ -1,0 +1,257 @@
+name: Validate missing Windows installation files
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Draft or published repaired release, v0.1.8 or later
+        required: true
+        default: v0.1.8
+      sha256:
+        description: Reviewed target Windows x64 installer SHA256
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  missing-install-recovery:
+    name: ${{ matrix.scenario }}
+    runs-on: windows-2022
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - old014-directory-deleted
+          - old014-uninstaller-deleted
+          - healthy017-directory-deleted
+          - old014-intact-control
+    env:
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      EXPECTED_SHA256: ${{ inputs.sha256 }}
+      SCENARIO: ${{ matrix.scenario }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Reproduce stale records and verify recovery with synthetic data
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$' -or $env:EXPECTED_SHA256 -notmatch '^[a-fA-F0-9]{64}$') { throw 'Invalid release input' }
+          $version = $env:RELEASE_TAG.Substring(1)
+          if ([version]$version -lt [version]'0.1.8') { throw 'Target must be v0.1.8 or later' }
+          $work = Join-Path $env:RUNNER_TEMP ('finance-toolbox-missing-' + $env:SCENARIO)
+          New-Item -ItemType Directory -Path $work -Force | Out-Null
+          $reportFile = Join-Path $work 'missing-install-result.json'
+          $installDir = 'D:\财务工具\finance-toolbox'
+          $appExe = Join-Path $installDir '财务工具箱.exe'
+          $uninstaller = Join-Path $installDir 'Uninstall 财务工具箱.exe'
+          $guid = 'd7402221-0d49-5689-bf01-77130581c89d'
+          $appKey = "HKCU:\Software\$guid"
+          $uninstallKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$guid"
+          $dataRoot = Join-Path $env:APPDATA '财务工具箱'
+          $engineData = Join-Path $dataRoot 'engine'
+          $marker = Join-Path $engineData 'synthetic-recovery-marker.txt'
+          $sqlite = Join-Path $engineData 'ci-preservation.sqlite3'
+          $oldVersion = if ($env:SCENARIO -eq 'healthy017-directory-deleted') { '0.1.7' } else { '0.1.4' }
+          $report = [ordered]@{status='RUNNING';scenario=$env:SCENARIO;oldVersion=$oldVersion;expectedVersion=$version;installerSha256=$env:EXPECTED_SHA256;checks=[Collections.Generic.List[object]]::new()}
+          $stage = 'prepare'
+          $savedGhToken = $env:GH_TOKEN
+          function Save-Report { $report | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $reportFile -Encoding utf8 }
+          function Registration {
+            $a=Get-ItemProperty -LiteralPath $appKey -ErrorAction SilentlyContinue
+            $u=Get-ItemProperty -LiteralPath $uninstallKey -ErrorAction SilentlyContinue
+            return @{directory=$a.InstallLocation;version=$u.DisplayVersion;uninstallString=$u.UninstallString;quietUninstallString=$u.QuietUninstallString}
+          }
+          function Invoke-Installer([string]$Exe,[string[]]$Arguments,[string]$Label,[int]$Seconds=180) {
+            Write-Host "Running $Label"
+            $started=[DateTime]::UtcNow
+            $originalModulePath=$env:PSModulePath
+            try {
+              if ($env:WinPSModulePath) { $env:PSModulePath=$env:WinPSModulePath }
+              $p=Start-Process -FilePath $Exe -ArgumentList $Arguments -PassThru
+              $null=$p.Handle
+            } finally { $env:PSModulePath=$originalModulePath }
+            if (-not $p.WaitForExit($Seconds*1000)) { taskkill /PID $p.Id /T /F | Out-Null; throw "$Label timed out" }
+            if ($null -eq $p.ExitCode) { throw "$Label exit code unavailable" }
+            $exit=[int]$p.ExitCode
+            $report.checks.Add(@{label=$Label;exitCode=$exit;seconds=[Math]::Round(([DateTime]::UtcNow-$started).TotalSeconds,3)})
+            Save-Report
+            return $exit
+          }
+          function Assert-Data {
+            if ((Get-FileHash -LiteralPath $marker -Algorithm SHA256).Hash -ne $script:markerHash) { throw 'Synthetic marker changed' }
+            if ((Get-FileHash -LiteralPath $sqlite -Algorithm SHA256).Hash -ne $script:sqliteHash) { throw 'Synthetic SQLite bytes changed' }
+            & python $script:sqliteFixture check $sqlite $env:SCENARIO
+            if ($LASTEXITCODE -ne 0) { throw 'Synthetic SQLite cannot be reopened with its original record' }
+          }
+          try {
+            if ((Test-Path -LiteralPath $appKey) -or (Test-Path -LiteralPath $uninstallKey) -or (Test-Path -LiteralPath $installDir)) { throw 'Runner must have no pre-existing application installation' }
+            if ((Test-Path -LiteralPath $dataRoot) -and @(Get-ChildItem -LiteralPath $dataRoot -Force).Count -ne 0) { throw 'Runner userData must be absent or empty; real data is forbidden' }
+            $newName="FinanceToolbox-$version-win-x64.exe"
+            foreach ($asset in @(@{tag='v0.1.4';name='FinanceToolbox-0.1.4-win-x64.exe'},@{tag='v0.1.7';name='FinanceToolbox-0.1.7-win-x64.exe'},@{tag=$env:RELEASE_TAG;name=$newName})) {
+              gh release download $asset.tag --repo $env:GH_REPO --pattern $asset.name --dir $work
+              if ($LASTEXITCODE -ne 0) { throw "Download failed: $($asset.name)" }
+            }
+            $old014=Join-Path $work 'FinanceToolbox-0.1.4-win-x64.exe'
+            $baseline017=Join-Path $work 'FinanceToolbox-0.1.7-win-x64.exe'
+            $target=Join-Path $work $newName
+            if ((Get-FileHash $old014 -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'd3808346548d64f78c3cab50f9e7e0bf7c0e49fb540b031c1a61c3c5c7fd80e7') { throw 'Reviewed 0.1.4 SHA256 mismatch' }
+            if ((Get-FileHash $baseline017 -Algorithm SHA256).Hash.ToLowerInvariant() -ne '8b8d25567df257d7864e9f3217e9a7f9f33e9f1d595e052b38eddf051c6d3201') { throw 'Reviewed 0.1.7 SHA256 mismatch' }
+            if ((Get-FileHash $target -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:EXPECTED_SHA256.ToLowerInvariant()) { throw 'Target SHA256 mismatch' }
+            $env:GH_TOKEN=$null
+            $initial=if ($oldVersion -eq '0.1.7') {$baseline017} else {$old014}
+            $stage='initial-real-installation'
+            if ((Invoke-Installer $initial @('/S','/currentuser',"/D=$installDir") $stage) -ne 0) { throw 'Initial installation failed' }
+            $initialRegistration=Registration
+            if ($initialRegistration.version -ne $oldVersion -or $initialRegistration.directory.TrimEnd('\') -ne $installDir) { throw 'Initial installation registry mismatch' }
+            if (-not (Test-Path $appExe) -or -not (Test-Path $uninstaller)) { throw 'Initial installation files missing' }
+            if ($oldVersion -eq '0.1.4' -and (Get-FileHash $uninstaller -Algorithm SHA256).Hash.ToLowerInvariant() -ne '141035ce8a989ece7167b23e3c34d22b5baaf2ec9058f6e573537b8b3ea6a934') { throw 'Expected exact known old broken uninstaller' }
+            New-Item -ItemType Directory -Path $engineData -Force | Out-Null
+            Set-Content -LiteralPath $marker 'SYNTHETIC DATA ONLY: preserve stale-install recovery and uninstall' -Encoding utf8
+            $script:sqliteFixture=Join-Path $work 'sqlite-fixture.py'
+            @'
+          import pathlib, sqlite3, sys
+          mode, filename, scenario = sys.argv[1:]
+          p = pathlib.Path(filename)
+          if mode == 'seed':
+              with sqlite3.connect(p) as db:
+                  db.execute('CREATE TABLE sentinel (id TEXT PRIMARY KEY, value TEXT NOT NULL)')
+                  db.execute('INSERT INTO sentinel VALUES (?,?)', ('synthetic-recovery-record', scenario))
+          else:
+              with sqlite3.connect(p.resolve().as_uri() + '?mode=ro', uri=True) as db:
+                  assert db.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+                  assert db.execute('SELECT id,value FROM sentinel').fetchall() == [('synthetic-recovery-record',scenario)]
+          '@ | Set-Content -LiteralPath $script:sqliteFixture -Encoding utf8
+            & python $script:sqliteFixture seed $sqlite $env:SCENARIO
+            if ($LASTEXITCODE -ne 0) { throw 'Synthetic SQLite creation failed' }
+            $script:markerHash=(Get-FileHash $marker -Algorithm SHA256).Hash
+            $script:sqliteHash=(Get-FileHash $sqlite -Algorithm SHA256).Hash
+            $stage='simulate-user-file-deletion'
+            if ($env:SCENARIO -in @('old014-directory-deleted','healthy017-directory-deleted')) {
+              # This exact, newly installed fixture directory belongs to this runner.
+              Remove-Item -LiteralPath $installDir -Recurse -Force
+            } elseif ($env:SCENARIO -eq 'old014-uninstaller-deleted') {
+              Remove-Item -LiteralPath $uninstaller -Force
+            }
+            $report.beforeRecovery=Registration
+            if ($env:SCENARIO -ne 'old014-intact-control') {
+              $stage='baseline017-missing-uninstaller-rejection'
+              if ((Invoke-Installer $baseline017 @('/S','/currentuser') $stage 120) -ne 2) { throw 'Expected 0.1.7 stale-install rejection exit 2' }
+              $afterRejected=Registration
+              foreach ($field in @('directory','version','uninstallString','quietUninstallString')) { if ($afterRejected[$field] -ne $report.beforeRecovery[$field]) { throw "Rejected baseline changed registry field $field" } }
+              if (Test-Path -LiteralPath $uninstaller) { throw 'Rejected baseline recreated the missing uninstaller' }
+              if ($env:SCENARIO -ne 'old014-uninstaller-deleted' -and (Test-Path -LiteralPath $installDir)) { throw 'Rejected baseline recreated the deleted installation directory' }
+              Assert-Data
+              $report.baseline017RejectedWithoutDataOrRegistryMutation=$true
+            }
+            $stage='target-reinstall-without-directory-override'
+            if ((Invoke-Installer $target @('/S','/currentuser') $stage 300) -ne 0) { throw 'Target recovery or intact-old upgrade failed' }
+            $newRegistration=Registration
+            if ($newRegistration.version -ne $version -or $newRegistration.directory.TrimEnd('\') -ne $installDir) { throw 'Target version or preserved installation location mismatch' }
+            if (-not (Test-Path -LiteralPath $appExe) -or -not (Test-Path -LiteralPath $uninstaller)) { throw 'Recovered executable or uninstaller missing' }
+            Assert-Data
+            $report.dataPreservedAfterRecovery=$true
+            $report.afterRecovery=$newRegistration
+            $stage='real-new-application-startup'
+            $startupScript=Join-Path $work 'startup.mjs'
+            @'
+          import assert from 'node:assert/strict';
+          import {spawn} from 'node:child_process';
+          import {writeFile} from 'node:fs/promises';
+          import path from 'node:path';
+          const app=spawn(process.env.CI_APP_EXE,['--remote-debugging-address=127.0.0.1','--remote-debugging-port=9222'],{env:{...process.env},stdio:'ignore'});
+          app.unref();
+          let socket;
+          const result={status:'FAIL',pid:app.pid};
+          const end=Date.now()+90000;
+          const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+          try {
+            let target;
+            while(Date.now()<end&&!target){try{const r=await fetch('http://127.0.0.1:9222/json/list',{signal:AbortSignal.timeout(1500)});target=(await r.json()).find(t=>t.type==='page'&&t.url.startsWith('toolbox://app/'));}catch{}if(!target)await sleep(500);}
+            assert.ok(target,'Renderer CDP did not become available');
+            socket=new WebSocket(target.webSocketDebuggerUrl);
+            await new Promise((resolve,reject)=>{const t=setTimeout(()=>reject(Error('CDP connect timeout')),5000);socket.addEventListener('open',()=>{clearTimeout(t);resolve();},{once:true});socket.addEventListener('error',()=>{clearTimeout(t);reject(Error('CDP connection error'));},{once:true});});
+            let id=0;
+            const evaluate=expression=>new Promise((resolve,reject)=>{const request=++id;const t=setTimeout(()=>{socket.removeEventListener('message',listener);reject(Error('Renderer API timed out'));},45000);const listener=event=>{const message=JSON.parse(event.data);if(message.id!==request)return;clearTimeout(t);socket.removeEventListener('message',listener);if(message.error||message.result.exceptionDetails)reject(Error('Renderer API rejected'));else resolve(message.result.result.value);};socket.addEventListener('message',listener);socket.send(JSON.stringify({id:request,method:'Runtime.evaluate',params:{expression,awaitPromise:true,returnByValue:true}}));});
+            let ready=false;while(Date.now()<end&&!ready){ready=await evaluate('Boolean(window.toolbox)');if(!ready)await sleep(250);}
+            assert.ok(ready);
+            const data=await evaluate('window.toolbox.getBootstrap()');
+            assert.equal(data.info.version,process.env.CI_EXPECTED_VERSION);
+            assert.equal(data.info.platform,'win32');assert.equal(data.info.packaged,true);assert.equal(data.info.pythonMode,'bundled');assert.ok(data.info.engineVersion);
+            assert.equal(path.resolve(data.info.dataDirectory).toLowerCase(),path.join(process.env.APPDATA,'财务工具箱','engine').toLowerCase());
+            result.status='PASS';result.version=data.info.version;result.bundledEngineConnected=true;
+          } catch(error){result.error=error.message;process.exitCode=1;}
+          finally{socket?.close();await writeFile(process.env.CI_STARTUP_REPORT,JSON.stringify(result,null,2));}
+          '@ | Set-Content -LiteralPath $startupScript -Encoding utf8
+            $startupReport=Join-Path $work 'startup-result.json'
+            $env:CI_APP_EXE=$appExe
+            $env:CI_EXPECTED_VERSION=$version
+            $env:CI_STARTUP_REPORT=$startupReport
+            & node $startupScript
+            if ($LASTEXITCODE -ne 0) { throw 'Real recovered application startup check failed' }
+            $startup=Get-Content -LiteralPath $startupReport -Raw | ConvertFrom-Json
+            if ($startup.status -ne 'PASS') { throw 'Real startup report did not pass' }
+            $report.applicationStartup=@{status=$startup.status;version=$startup.version;bundledEngineConnected=$startup.bundledEngineConnected}
+            $live=Get-Process -Id $startup.pid -ErrorAction Stop
+            $null=$live.Handle
+            if (-not $live.CloseMainWindow() -or -not $live.WaitForExit(30000)) { throw 'Recovered app did not close gracefully' }
+            Assert-Data
+            $stage='normal-uninstall'
+            $outside=Join-Path $work 'target-uninstaller-outside-install-dir.exe'
+            Copy-Item -LiteralPath $uninstaller -Destination $outside
+            if ((Invoke-Installer $outside @('/S','/currentuser','/KEEP_APP_DATA',"_?=$installDir") $stage) -ne 0) { throw 'Recovered normal uninstall failed' }
+            if ((Test-Path -LiteralPath $appExe) -or (Test-Path -LiteralPath $uninstallKey)) { throw 'Normal uninstall left the application or uninstall entry' }
+            Assert-Data
+            $report.dataPreservedAfterNormalUninstall=$true
+            $report.syntheticSQLiteReopenedAndUnchanged=$true
+            if ($env:SCENARIO -eq 'old014-intact-control') {
+              $stage='broken-junction-remains-blocked'
+              $link=Join-Path $work 'broken-parent-link'
+              $targetDirectory=Join-Path $work 'deleted-link-target'
+              New-Item -ItemType Directory -Path $targetDirectory | Out-Null
+              New-Item -ItemType Junction -Path $link -Target $targetDirectory | Out-Null
+              Remove-Item -LiteralPath $targetDirectory -Recurse -Force
+              $linkedRoot=Join-Path $link 'finance-toolbox'
+              $linkedUninstaller=Join-Path $linkedRoot 'Uninstall 财务工具箱.exe'
+              Add-Type 'using System; using System.Runtime.InteropServices; public static class RecoveryNative { [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern int GetFileAttributes(string path); }'
+              $attrs=[RecoveryNative]::GetFileAttributes($linkedUninstaller)
+              $nativeError=[Runtime.InteropServices.Marshal]::GetLastWin32Error()
+              if ($attrs -ne -1 -or $nativeError -notin @(2,3)) { throw 'Expected real missing-file error behind broken junction' }
+              New-Item -Path $appKey -Force | Out-Null
+              New-Item -Path $uninstallKey -Force | Out-Null
+              Set-ItemProperty -LiteralPath $appKey -Name InstallLocation -Value $linkedRoot
+              Set-ItemProperty -LiteralPath $uninstallKey -Name UninstallString -Value ('"'+$linkedUninstaller+'" /currentuser')
+              Set-ItemProperty -LiteralPath $uninstallKey -Name DisplayVersion -Value '0.1.4'
+              if ((Invoke-Installer $target @('/S','/currentuser') $stage 120) -ne 2) { throw 'Broken junction was incorrectly treated as an ordinary deletion' }
+              if (Test-Path -LiteralPath $targetDirectory) { throw 'Blocked installation recreated junction target' }
+              Assert-Data
+              $report.brokenJunctionRejectedWithoutDataMutation=$true
+            }
+            $report.status='PASS'
+          } catch {
+            $report.status='FAIL'
+            $report.failedStage=$stage
+            $report.failureMessage=$_.Exception.Message
+            $report.finalRegistration=Registration
+            throw
+          } finally {
+            $env:GH_TOKEN=$savedGhToken
+            Save-Report
+            $report | ConvertTo-Json -Depth 10 | Write-Host
+          }
+      - name: Upload only synthetic recovery and startup reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-missing-install-${{ matrix.scenario }}
+          path: |
+            ${{ runner.temp }}/finance-toolbox-missing-${{ matrix.scenario }}/missing-install-result.json
+            ${{ runner.temp }}/finance-toolbox-missing-${{ matrix.scenario }}/startup-result.json
+          if-no-files-found: warn
+          retention-days: 14
