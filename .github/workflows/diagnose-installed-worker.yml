@@ -1,0 +1,71 @@
+name: Diagnose installed Windows worker bootstrap
+
+on:
+  workflow_dispatch:
+
+permissions:
+  # Read the reviewed 0.1.8 asset even while its release is still a draft.
+  contents: write
+
+jobs:
+  installed-engine-worker:
+    runs-on: windows-2022
+    timeout-minutes: 12
+    env:
+      GH_REPO: ${{ github.repository }}
+      EXPECTED_SHA256: 48fb8cc2122bdeb27275a922cb2ea4d31cecfb82da7e08957b5caefdc7d3c984
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Download reviewed 0.1.8 and install into disposable temporary directory
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GH_REPO -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Invalid repository' }
+          $work = Join-Path $env:RUNNER_TEMP 'finance-toolbox-worker-diagnostic'
+          New-Item -ItemType Directory -Path $work -Force | Out-Null
+          $installDir = Join-Path $work '财务工具箱 已安装程序'
+          $name = 'FinanceToolbox-0.1.8-win-x64.exe'
+          gh release download v0.1.8 --repo $env:GH_REPO --pattern $name --dir $work
+          if ($LASTEXITCODE -ne 0) { throw 'Reviewed installer download failed' }
+          $installer = Join-Path $work $name
+          if ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:EXPECTED_SHA256) { throw 'Reviewed installer hash mismatch' }
+          # The installer sees the native Windows environment, without a PAT.
+          $env:GH_TOKEN = $null
+          $oldModulePath = $env:PSModulePath
+          try {
+            if ($env:WinPSModulePath) { $env:PSModulePath = $env:WinPSModulePath }
+            $process = Start-Process -FilePath $installer -ArgumentList @('/S','/currentuser',"/D=$installDir") -PassThru
+            $null = $process.Handle
+          } finally { $env:PSModulePath = $oldModulePath }
+          if (-not $process.WaitForExit(180000)) { taskkill /PID $process.Id /T /F | Out-Null; throw 'Reviewed installer timed out' }
+          if ($null -eq $process.ExitCode -or $process.ExitCode -ne 0) { throw "Reviewed installer failed: $($process.ExitCode)" }
+          $engine = Join-Path $installDir 'resources\engine'
+          foreach ($item in @('python.exe','pythonw.exe','python314._pth','app\main.py')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $engine $item))) { throw "Installed engine file missing: $item" }
+          }
+          "DIAGNOSTIC_WORK=$work" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "DIAGNOSTIC_ENGINE=$engine" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Run real JSONL tasks with zero and sixty synthetic supplier records
+        shell: pwsh
+        run: |
+          # This helper must be committed next to this workflow in the update repo.
+          # No third-party package, source checkout, real finance file, Electron
+          # test hook, or product modification is needed for these four probes.
+          node .github/scripts/diagnose-installed-worker.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Worker diagnostic harness could not complete all probes; inspect the synthetic logs' }
+
+      - name: Upload synthetic worker diagnostics only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installed-worker-diagnostic
+          path: ${{ runner.temp }}/finance-toolbox-worker-diagnostic/diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
