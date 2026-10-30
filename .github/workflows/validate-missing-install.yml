@@ -165,7 +165,7 @@ jobs:
           import {spawn} from 'node:child_process';
           import {writeFile} from 'node:fs/promises';
           import path from 'node:path';
-          const app=spawn(process.env.CI_APP_EXE,['--remote-debugging-address=127.0.0.1','--remote-debugging-port=9222'],{env:{...process.env},stdio:'ignore'});
+          const app=spawn(process.env.CI_APP_EXE,['--remote-debugging-address=127.0.0.1','--remote-debugging-port=9222'],{env:{...process.env},stdio:'ignore',detached:true});
           app.unref();
           let socket;
           const result={status:'FAIL',pid:app.pid};
