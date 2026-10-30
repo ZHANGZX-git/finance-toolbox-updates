@@ -132,6 +132,21 @@ async function completedTask(label, request) {
     await delay(100);
   }
   report.cases.push({ label, job: last ?? submitted, events: engine.events.filter(event => event.event === 'job.changed' && event.data?.id === submitted.id) });
+  if (last?.status === 'needs_attention') {
+    // This workflow creates every input itself. Keep the actual synthetic
+    // business preflight reason rather than reporting only its aggregate count.
+    const issueReports = [];
+    for (const filename of last.outputs.filter(value => value.toLowerCase().endsWith('.csv'))) {
+      try {
+        const contents = await readFile(filename, 'utf8');
+        const limit = 64 * 1024;
+        const text = contents.slice(0, limit);
+        issueReports.push({ path: filename, text, truncated: contents.length > limit });
+        await writeFile(path.join(logs, `${label.replace(/[^A-Za-z0-9_-]/g, '_')}-issues.csv`), text);
+      } catch (error) { issueReports.push({ path: filename, readError: error.message }); }
+    }
+    report.cases.at(-1).issueReports = issueReports;
+  }
   await saveReport();
   assert.equal(last?.status, 'completed', `${label}: ${last?.error || last?.message || 'task timeout'}`);
   assert.equal(last.progress, 100);
