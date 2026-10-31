@@ -1,0 +1,82 @@
+name: Validate Windows 0.1.14 installed voucher workflows
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Reviewed draft or published Windows 0.1.14 release
+        required: true
+        default: v0.1.14
+      sha256:
+        description: Reviewed SHA256 of the target Windows x64 installer
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  installed-worker-acceptance:
+    runs-on: windows-2022
+    timeout-minutes: 12
+    env:
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      EXPECTED_SHA256: ${{ inputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Download reviewed target and install in a disposable directory
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GH_REPO -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Invalid repository' }
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$') { throw 'Invalid release tag' }
+          if ($env:EXPECTED_SHA256 -notmatch '^[a-fA-F0-9]{64}$') { throw 'Invalid reviewed SHA256' }
+          $version = $env:RELEASE_TAG.Substring(1)
+          if ([version]$version -ne [version]'0.1.14') { throw 'This acceptance targets version 0.1.14' }
+          $work = Join-Path $env:RUNNER_TEMP 'finance-toolbox-worker-acceptance'
+          New-Item -ItemType Directory -Path $work -Force | Out-Null
+          $installDir = Join-Path $work '财务工具箱 已安装程序'
+          $name = "FinanceToolbox-$version-win-x64.exe"
+          gh release download $env:RELEASE_TAG --repo $env:GH_REPO --pattern $name --dir $work
+          if ($LASTEXITCODE -ne 0) { throw 'Reviewed installer download failed' }
+          $installer = Join-Path $work $name
+          if ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:EXPECTED_SHA256.ToLowerInvariant()) { throw 'Reviewed installer hash mismatch' }
+          $env:GH_TOKEN = $null
+          $oldModulePath = $env:PSModulePath
+          try {
+            if ($env:WinPSModulePath) { $env:PSModulePath = $env:WinPSModulePath }
+            $process = Start-Process -FilePath $installer -ArgumentList @('/S','/currentuser',"/D=$installDir") -PassThru
+            $null = $process.Handle
+          } finally { $env:PSModulePath = $oldModulePath }
+          if (-not $process.WaitForExit(180000)) { taskkill /PID $process.Id /T /F | Out-Null; throw 'Reviewed installer timed out' }
+          if ($null -eq $process.ExitCode -or $process.ExitCode -ne 0) { throw "Reviewed installer failed: $($process.ExitCode)" }
+          $engine = Join-Path $installDir 'resources\engine'
+          foreach ($item in @('python.exe','pythonw.exe','python314._pth','app\main.py')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $engine $item))) { throw "Installed engine file missing: $item" }
+          }
+          "EXPECTED_VERSION=$version" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "ACCEPTANCE_WORK=$work" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "ACCEPTANCE_ENGINE=$engine" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Execute all four voucher flows, migration, restart and snapshots
+        shell: pwsh
+        run: |
+          # The three helper files live in .github/scripts/. They use only Node's
+          # standard library and the installed release's stdlib-only CPython.
+          node .github/scripts/accept-v014-vouchers.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Installed Windows 0.1.14 voucher acceptance failed' }
+
+      - name: Upload synthetic acceptance results only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-v014-installed-vouchers
+          path: ${{ runner.temp }}/finance-toolbox-worker-acceptance/diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
